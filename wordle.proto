@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package main;
+
+enum Color {
+    GRAY = 0;
+    YELLOW = 1;
+    GREEN = 2;
+}
+
+// Server -> Client
+// Assigns a unique id to the client
+message JoinResponse {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+}
+
+// Client -> Server
+// User ready to start game
+message ReadyRequest {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+}
+
+// Server -> Client
+// Game is starting
+message StartResponse {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+}
+
+// Client -> Server
+// User's guess
+message GuessRequest {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+    string guess = 2;
+}
+
+// Server -> Client
+// Color response to user's guess
+message GuessResponse {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+    Color colors = 2;
+}
+
+// Server -> Client
+// Color response to opponent's guess
+message OpponentUpdateResponse {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+    Color colors = 3;
+}
+
+// Client -> Server
+// Game is over
+message FinishResponse {
+    google.protobuf.Timestamp time_stamp = 1;
+    uint64 uid = 1;
+    bool win = 2;
+}
