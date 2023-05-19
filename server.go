@@ -1,32 +1,29 @@
 package main
 
 import (
-	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
-	"os"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+
+	"nhooyr.io/websocket"
 )
-
-type GAME_STATE struct {
-	target_word string
-	game_over   bool
-}
-
-func make_game_state() *GAME_STATE {
-	return &GAME_STATE{
-		target_word: target_words[rand.Intn(TARGET_WORDS_SIZE-1)],
-		game_over:   false,
-	}
-}
 
 func load_words() {
 	read_file("wordle-La.txt", target_words[:])
 	read_file("wordle-Ta.txt", guessable_words[:])
 }
 
-func process_guess(state *GAME_STATE, guess string) [WORD_LENGTH]Color {
+func process_guess(state *game_state, guess string) [WORD_LENGTH]Color {
 	ret := [WORD_LENGTH]Color{}
 	for index, letter := range guess {
 		if letter == rune(state.target_word[index]) {
@@ -40,59 +37,182 @@ func process_guess(state *GAME_STATE, guess string) [WORD_LENGTH]Color {
 	return ret
 }
 
-type Color int
+// chatServer enables broadcasting to a set of subscribers.
+type chatServer struct {
+	// subscriberMessageBuffer controls the max number
+	// of messages that can be queued for a subscriber
+	// before it is kicked.
+	//
+	// Defaults to 16.
+	subscriberMessageBuffer int
 
-const (
-	GRAY Color = iota
-	YELLOW
-	GREEN
-)
+	// publishLimiter controls the rate limit applied to the publish endpoint.
+	//
+	// Defaults to one publish every 100ms with a burst of 8.
+	publishLimiter *rate.Limiter
 
-const TARGET_WORDS_SIZE int = 2315
-const GUESSABLE_WORDS_SIZE int = 10657
-const WORD_LENGTH int = 5
+	// logf controls where logs are sent.
+	// Defaults to log.Printf.
+	logf func(f string, v ...interface{})
 
-var target_words [TARGET_WORDS_SIZE]string
-var guessable_words [GUESSABLE_WORDS_SIZE]string
+	// serveMux routes the various endpoints to the appropriate handler.
+	serveMux http.ServeMux
 
-func read_file(filename string, data []string) {
-	f, err := os.Open(filename)
+	subscribersMu sync.Mutex
+	subscribers   map[*subscriber]struct{}
+}
+
+// newChatServer constructs a chatServer with the defaults.
+func newChatServer() *chatServer {
+	cs := &chatServer{
+		subscriberMessageBuffer: 16,
+		logf:                    log.Printf,
+		subscribers:             make(map[*subscriber]struct{}),
+		publishLimiter:          rate.NewLimiter(rate.Every(time.Millisecond*100), 8),
+	}
+	cs.serveMux.Handle("/", http.FileServer(http.Dir(".")))
+
+	cs.serveMux.HandleFunc("/join", cs.joinHandler) // client joins game
+	// cs.serveMux.HandleFunc("/ready", cs.readyHandler)   // client is ready to start game
+	// cs.serveMux.HandleFunc("/guess", cs.guessHandler)   // client makes a guess
+	cs.serveMux.HandleFunc("/publish", cs.publishHandler)
+
+	return cs
+}
+
+// subscriber represents a subscriber.
+// Messages are sent on the msgs channel and if the client
+// cannot keep up with the messages, closeSlow is called.
+type subscriber struct {
+	msgs      chan []byte
+	closeSlow func()
+	uid       uint64
+}
+
+func (cs *chatServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cs.serveMux.ServeHTTP(w, r)
+}
+
+// subscribeHandler accepts the WebSocket connection and then subscribes
+// it to all future messages.
+func (cs *chatServer) joinHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("subscribed")
+	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		log.Fatal(err)
+		cs.logf("%v", err)
+		return
+	}
+	defer c.Close(websocket.StatusInternalError, "")
+
+	err = cs.subscribe(r.Context(), c)
+
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if websocket.CloseStatus(err) == websocket.StatusNormalClosure ||
+		websocket.CloseStatus(err) == websocket.StatusGoingAway {
+		return
+	}
+	if err != nil {
+		cs.logf("%v", err)
+		return
 	}
 
-	// remember to close the file at the end of the program
-	defer f.Close()
+}
 
-	// read the file line by line using scanner
-	scanner := bufio.NewScanner(f)
-
-	var i = 0
-	for scanner.Scan() {
-		// do something with a line
-		// fmt.Printf("line: %s\n", scanner.Text())
-		data[i] = scanner.Text()
-		i++
+// publishHandler reads the request body with a limit of 8192 bytes and then publishes
+// the received message.
+func (cs *chatServer) publishHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
+	body := http.MaxBytesReader(w, r.Body, 8192)
+	msg, err := ioutil.ReadAll(body)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+		return
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Fatal(err)
+	cs.publish(msg)
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// subscribe subscribes the given WebSocket to all broadcast messages.
+// It creates a subscriber with a buffered msgs chan to give some room to slower
+// connections and then registers the subscriber. It then listens for all messages
+// and writes them to the WebSocket. If the context is cancelled or
+// an error occurs, it returns and deletes the subscription.
+//
+// It uses CloseRead to keep reading from the connection to process control
+// messages and cancel the context if the connection drops.
+func (cs *chatServer) subscribe(ctx context.Context, c *websocket.Conn) error {
+	ctx = c.CloseRead(ctx)
+
+	s := &subscriber{
+		msgs: make(chan []byte, cs.subscriberMessageBuffer),
+		closeSlow: func() {
+			c.Close(websocket.StatusPolicyViolation, "connection too slow to keep up with messages")
+		},
+		uid: rand.Uint64(),
+	}
+
+	cs.addSubscriber(s)
+	defer cs.deleteSubscriber(s)
+
+	//make s.uid to string
+	uid := strconv.FormatUint(s.uid, 10)
+	cs.publish([]byte(uid))
+	for {
+		select {
+		case msg := <-s.msgs:
+			err := writeTimeout(ctx, time.Second*5, c, msg)
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+}
+
+// publish publishes the msg to all subscribers.
+// It never blocks and so messages to slow subscribers
+// are dropped.
+func (cs *chatServer) publish(msg []byte) {
+	cs.subscribersMu.Lock()
+	defer cs.subscribersMu.Unlock()
+
+	cs.publishLimiter.Wait(context.Background())
+
+	for s := range cs.subscribers {
+		select {
+		case s.msgs <- msg:
+		default:
+			go s.closeSlow()
+		}
 	}
 }
 
-func main() {
+// addSubscriber registers a subscriber.
+func (cs *chatServer) addSubscriber(s *subscriber) {
+	cs.subscribersMu.Lock()
+	cs.subscribers[s] = struct{}{}
+	cs.subscribersMu.Unlock()
+}
 
-	load_words()
+// deleteSubscriber deletes the given subscriber.
+func (cs *chatServer) deleteSubscriber(s *subscriber) {
+	cs.subscribersMu.Lock()
+	delete(cs.subscribers, s)
+	cs.subscribersMu.Unlock()
+}
 
-	state := make_game_state()
+func writeTimeout(ctx context.Context, timeout time.Duration, c *websocket.Conn, msg []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	var c Color = GRAY
-	fmt.Println(c)
-
-	// fmt.Println(target_words[rand.Intn(TARGET_WORDS_SIZE-1)])
-	// fmt.Println(guessable_words[rand.Intn(GUESSABLE_WORDS_SIZE-1)])
-	fmt.Println(state.target_word)
-	t := process_guess(state, "hello")
-	fmt.Println(t)
-
+	return c.Write(ctx, websocket.MessageText, msg)
 }

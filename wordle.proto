@@ -1,5 +1,5 @@
 syntax = "proto3";
-
+option go_package = "./main";
 import "google/protobuf/timestamp.proto";
 
 package main;
@@ -14,44 +14,44 @@ enum Color {
 // Assigns a unique id to the client
 message JoinResponse {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
+    uint64 uid = 2;
 }
 
 // Client -> Server
 // User ready to start game
 message ReadyRequest {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
+    uint64 uid = 2;
 }
 
 // Server -> Client
 // Game is starting
 message StartResponse {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
+    uint64 uid = 2;
 }
 
 // Client -> Server
 // User's guess
 message GuessRequest {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
-    string guess = 2;
+    uint64 uid = 2;
+    string guess = 3;
 }
 
 // Server -> Client
 // Color response to user's guess
 message GuessResponse {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
-    Color colors = 2;
+    uint64 uid = 2;
+    Color colors = 3;
 }
 
 // Server -> Client
 // Color response to opponent's guess
 message OpponentUpdateResponse {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
+    uint64 uid = 2;
     Color colors = 3;
 }
 
@@ -59,6 +59,6 @@ message OpponentUpdateResponse {
 // Game is over
 message FinishResponse {
     google.protobuf.Timestamp time_stamp = 1;
-    uint64 uid = 1;
-    bool win = 2;
+    uint64 uid = 2;
+    bool win = 3;
 }
